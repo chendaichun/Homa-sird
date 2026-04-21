@@ -263,21 +263,24 @@ SendPeriodic (Ptr<Socket> socket,
               InetSocketAddress dst,
               uint32_t msgSizeBytes,
               Time interval,
-              Time stopTime)
+              Time stopTime,
+              uint32_t remainingMessages)
 {
-  if (Simulator::Now () >= stopTime)
+  if (Simulator::Now () >= stopTime || remainingMessages == 0)
     {
       return;
     }
 
   socket->SendTo (Create<Packet> (msgSizeBytes), 0, dst);
+  uint32_t nextRemainingMessages = remainingMessages == 0xffffffffu ? 0xffffffffu : remainingMessages - 1;
   Simulator::Schedule (interval,
                        &SendPeriodic,
                        socket,
                        dst,
                        msgSizeBytes,
                        interval,
-                       stopTime);
+                       stopTime,
+                       nextRemainingMessages);
 }
 
 int
@@ -313,6 +316,9 @@ main (int argc, char* argv[])
   // 短流 probe 发送周期；值越小，短流注入压力越高。
   uint64_t shortIntervalUs = 200;
 
+  // Probe 最多发送多少条消息；0 表示只按 durationSec 控制，不限制条数。
+  uint32_t targetProbeMessages = 0;
+
   // 是否注入 6 个 10MB 背景长流；关闭后可生成 unloaded probe baseline。
   bool enableBackgroundTraffic = true;
 
@@ -346,8 +352,9 @@ main (int argc, char* argv[])
   // 进度条刷新周期，单位毫秒。
   double progressIntervalMs = 1.0;
 
-  // 单向 BDP，单位为包。100Gbps、约 2us 单向路径、约 1500B/packet 时约为 16.6pkts。
-  double bdpPkts = 16.6;
+  // RTT BDP，单位为包。100Gbps、约 2us 单向路径、约 1500B/packet 时单向约 16.66pkts，
+  // 往返约 33.32pkts；Homa/SIRD 的 BDP 派生阈值统一使用这个 RTT BDP。
+  double bdpPkts = 33.32;
 
   // Homa 可用的总优先级队列数量。
   uint8_t numTotalPrioBands = 8;
@@ -371,7 +378,7 @@ main (int argc, char* argv[])
   double sirdEcnAlphaGain = 0.125;
 
   // PointToPointNetDevice 的发送队列上限；这是每端口设备队列，不是交换机共享 buffer。
-  std::string deviceQueueMaxSize = "1000p";
+  std::string deviceQueueMaxSize = "17p";
 
   // SirdQueueDisc 队列上限；保持较浅，避免过深队列掩盖排队延迟。
   std::string qdiscMaxSize = "1000p";
@@ -387,6 +394,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("longSenderRateGbps", "Per-long-sender offered rate", longSenderRateGbps);
   cmd.AddValue ("shortMsgSizeBytes", "Probe short-flow message size, e.g. 8 or 500000", shortMsgSizeBytes);
   cmd.AddValue ("shortIntervalUs", "Probe send interval in microseconds", shortIntervalUs);
+  cmd.AddValue ("targetProbeMessages", "Maximum number of probe messages to send; 0 means unlimited within durationSec", targetProbeMessages);
   cmd.AddValue ("enableBackgroundTraffic", "Whether to generate the 6 long background senders", enableBackgroundTraffic);
   cmd.AddValue ("useSrrScheduling", "Use FIFO/SRR-like receiver scheduling instead of SRPT", useSrrScheduling);
   cmd.AddValue ("traceMsg", "Whether to trace message begin/finish events", traceMsg);
@@ -398,7 +406,7 @@ main (int argc, char* argv[])
   cmd.AddValue ("traceSirdLoop", "Whether to trace per-sender SIRD loop state", traceSirdLoop);
   cmd.AddValue ("showProgressBar", "Whether to display simulation progress bar in terminal", showProgressBar);
   cmd.AddValue ("progressIntervalMs", "Progress bar refresh interval in milliseconds", progressIntervalMs);
-  cmd.AddValue ("bdpPkts", "One-way path BDP in packets; all SIRD/Homa thresholds are derived from it", bdpPkts);
+  cmd.AddValue ("bdpPkts", "RTT BDP in packets; all SIRD/Homa thresholds are derived from it", bdpPkts);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
   cmd.AddValue ("sirdEcnAiStep", "SIRD ECN additive increase step", sirdEcnAiStep);
   cmd.AddValue ("sirdSenderMdFactor", "SIRD sender-feedback multiplicative decrease factor", sirdSenderMdFactor);
@@ -411,7 +419,7 @@ main (int argc, char* argv[])
   auto roundPackets = [] (double value) -> uint16_t {
     return static_cast<uint16_t> (std::max<long> (1, std::lround (value)));
   };
-  uint32_t rttPkts = static_cast<uint32_t> (std::max<long> (1, static_cast<long> (std::ceil (2.0 * bdpPkts))));
+  uint32_t homaBdpPkts = roundPackets (bdpPkts);
   uint16_t sirdCreditBudgetPkts = roundPackets (1.5 * bdpPkts);
   uint16_t sirdUnschThresholdPkts = roundPackets (1.0 * bdpPkts);
   uint16_t sirdSenderCsnThresholdPkts = roundPackets (0.5 * bdpPkts);
@@ -423,7 +431,7 @@ main (int argc, char* argv[])
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (rttPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (numTotalPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (numUnschedPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::UseSrrScheduling", BooleanValue (useSrrScheduling));
@@ -611,7 +619,8 @@ main (int argc, char* argv[])
                                receiverAddr,
                                longMsgSizeBytes,
                                longInterval,
-                               stopTime);
+                               stopTime,
+                               0xffffffffu);
         }
     }
 
@@ -624,7 +633,8 @@ main (int argc, char* argv[])
                        receiverAddr,
                        shortMsgSizeBytes,
                        shortInterval,
-                       stopTime);
+                       stopTime,
+                       targetProbeMessages == 0 ? 0xffffffffu : targetProbeMessages);
 
   Simulator::Stop (simStopTime);
   Time progressInterval = MilliSeconds (std::max (1.0, progressIntervalMs));

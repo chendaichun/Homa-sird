@@ -9,36 +9,49 @@ PROFILE="${1:-fast}"
 START_SEC="${START_SEC:-0.2}"
 DURATION_SEC="${DURATION_SEC:-0.6}"
 FLOW_GAP_US="${FLOW_GAP_US:-200000}"
+ACTIVE_RECEIVER_COUNT="${ACTIVE_RECEIVER_COUNT:-3}"
+SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC:-0.1}"
+SEND_INTERVAL_US="${SEND_INTERVAL_US:-400}"
 
-if [[ "$PROFILE" == "full" ]]; then
+if [[ "$PROFILE" == "smoke" ]]; then
+  START_SEC="${START_SEC_SMOKE:-0.2}"
+  DURATION_SEC="${DURATION_SEC_SMOKE:-0.15}"
+  FLOW_GAP_US="${FLOW_GAP_US_SMOKE:-50000}"
+  SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC_SMOKE:-0.05}"
+elif [[ "$PROFILE" == "one_receiver_smoke" ]]; then
+  START_SEC="${START_SEC_ONE_RECEIVER_SMOKE:-0.2}"
+  DURATION_SEC="${DURATION_SEC_ONE_RECEIVER_SMOKE:-0.05}"
+  FLOW_GAP_US="${FLOW_GAP_US_ONE_RECEIVER_SMOKE:-50000}"
+  ACTIVE_RECEIVER_COUNT="${ACTIVE_RECEIVER_COUNT_ONE_RECEIVER_SMOKE:-1}"
+  SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC_ONE_RECEIVER_SMOKE:-0.0}"
+elif [[ "$PROFILE" == "full" ]]; then
   START_SEC="${START_SEC_FULL:-0.2}"
   DURATION_SEC="${DURATION_SEC_FULL:-13.2}"
   FLOW_GAP_US="${FLOW_GAP_US_FULL:-4500000}"
+  SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC_FULL:-0.1}"
 elif [[ "$PROFILE" != "fast" ]]; then
-  echo "Usage: bash scripts/lab2.sh [fast|full]"
+  echo "Usage: bash scripts/lab2.sh [smoke|one_receiver_smoke|fast|full]"
   exit 2
 fi
 
 BUILD="${BUILD:-1}"
 PLOT="${PLOT:-1}"
 OUTCAST_MSG_SIZE_BYTES="${OUTCAST_MSG_SIZE_BYTES:-10000000}"
+TRACE_MSG="${TRACE_MSG:-0}"
+TRACE_PROTOCOL_CREDIT="${TRACE_PROTOCOL_CREDIT:-1}"
 TRACE_SIRD_CREDIT="${TRACE_SIRD_CREDIT:-0}"
 TRACE_SIRD_BUCKET="${TRACE_SIRD_BUCKET:-0}"
 TRACE_CREDIT_EVENTS="${TRACE_CREDIT_EVENTS:-0}"
-TRACE_CREDIT_SERIES="${TRACE_CREDIT_SERIES:-1}"
 TRACE_SWITCH_QUEUE="${TRACE_SWITCH_QUEUE:-1}"
+CREDIT_SAMPLE_US="${CREDIT_SAMPLE_US:-100}"
 TRACE_SWITCH_QUEUE_SAMPLE_US="${TRACE_SWITCH_QUEUE_SAMPLE_US:-1000}"
 
-# Paper-aligned defaults for Section 6.1:
-# BDP=24 pkts, B=1.5*BDP=36 pkts, UnschT=1*BDP=24 pkts, SThr=0.5*BDP=12 pkts.
-RTT_PKTS="${RTT_PKTS:-24}"
-SIRD_CREDIT_BUDGET_PKTS="${SIRD_CREDIT_BUDGET_PKTS:-36}"
-SIRD_UNSCH_THRESHOLD_PKTS="${SIRD_UNSCH_THRESHOLD_PKTS:-24}"
-SIRD_CSN_THRESHOLD_PKTS="${SIRD_CSN_THRESHOLD_PKTS:-12}"
+# Topology-derived RTT BDP in packets for the current lab2 topology.
+BDP_PKTS="${BDP_PKTS:-33.32}"
+SIRD_CSN_THRESHOLD_PKTS="${SIRD_CSN_THRESHOLD_PKTS:-$(awk "BEGIN { printf \"%d\", (0.5 * $BDP_PKTS) + 0.5 }")}"
 SIRD_INF_CSN_THRESHOLD_PKTS="${SIRD_INF_CSN_THRESHOLD_PKTS:-65535}"
-DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-2000p}"
+DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-17p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
-QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-0p}"
 
 TRACE_DIR="${TRACE_DIR:-$ROOT_DIR/outputs/sird-scenarios/HomaL4Protocol-lab2-sender-congestion}"
 PLOT_OUT_DIR="${PLOT_OUT_DIR:-$ROOT_DIR/output-f/lab2}"
@@ -55,25 +68,23 @@ fi
 COMMON_ARGS=(
   "--enableSird=1"
   "--outputDir=$TRACE_DIR"
-  "--traceMsg=1"
+  "--traceMsg=$TRACE_MSG"
+  "--traceProtocolCredit=$TRACE_PROTOCOL_CREDIT"
   "--traceSirdCredit=$TRACE_SIRD_CREDIT"
   "--traceSirdBucket=$TRACE_SIRD_BUCKET"
   "--traceCreditEvents=$TRACE_CREDIT_EVENTS"
-  "--traceCreditSeries=$TRACE_CREDIT_SERIES"
   "--traceSwitchEgressQueue=$TRACE_SWITCH_QUEUE"
-  "--creditSampleUs=1000"
   "--switchQueueSampleUs=$TRACE_SWITCH_QUEUE_SAMPLE_US"
-  "--rttPkts=$RTT_PKTS"
-  "--sirdCreditBudgetPkts=$SIRD_CREDIT_BUDGET_PKTS"
-  "--sirdUnschThresholdPkts=$SIRD_UNSCH_THRESHOLD_PKTS"
+  "--bdpPkts=$BDP_PKTS"
   "--startSec=$START_SEC"
   "--durationSec=$DURATION_SEC"
-  "--settleTailSec=0.1"
+  "--settleTailSec=$SETTLE_TAIL_SEC"
   "--msgSizeBytes=$OUTCAST_MSG_SIZE_BYTES"
   "--flowGapUs=$FLOW_GAP_US"
+  "--sendIntervalUs=$SEND_INTERVAL_US"
+  "--activeReceiverCount=$ACTIVE_RECEIVER_COUNT"
   "--deviceQueueMaxSize=$DEVICE_QUEUE_MAX_SIZE"
   "--qdiscMaxSize=$QDISC_MAX_SIZE"
-  "--qdiscMarkThreshold=$QDISC_MARK_THRESHOLD"
 )
 
 run_case() {
@@ -87,8 +98,9 @@ run_case() {
     "$TRACE_DIR/lab2_${tag}.msg.tr" \
     "$TRACE_DIR/lab2_${tag}.sird-credit.tr" \
     "$TRACE_DIR/lab2_${tag}.sird-bucket.tr" \
+    "$TRACE_DIR/lab2_${tag}.sender-credit.tr" \
+    "$TRACE_DIR/lab2_${tag}.receiver-credit.tr" \
     "$TRACE_DIR/lab2_${tag}.credit-events.tr" \
-    "$TRACE_DIR/lab2_${tag}.credit-series.tr" \
     "$TRACE_DIR/lab2_${tag}.switch-egress-queue.tr"
 
   echo "[$tag] start $(date '+%F %T')" | tee "$log_file"
@@ -101,7 +113,7 @@ run_case() {
   echo "[$tag] done $(date '+%F %T')" | tee -a "$log_file"
 }
 
-echo "profile=$PROFILE durationSec=$DURATION_SEC flowGapUs=$FLOW_GAP_US"
+echo "profile=$PROFILE durationSec=$DURATION_SEC flowGapUs=$FLOW_GAP_US sendIntervalUs=$SEND_INTERVAL_US activeReceiverCount=$ACTIVE_RECEIVER_COUNT sampleUs=$CREDIT_SAMPLE_US settleTailSec=$SETTLE_TAIL_SEC traceMsg=$TRACE_MSG traceProtocolCredit=$TRACE_PROTOCOL_CREDIT traceSirdCredit=$TRACE_SIRD_CREDIT traceSirdBucket=$TRACE_SIRD_BUCKET traceCreditEvents=$TRACE_CREDIT_EVENTS"
 echo "outputs: $TRACE_DIR"
 
 pids=()
@@ -132,6 +144,7 @@ if [[ "$PLOT" == "1" ]]; then
     --out-dir "$PLOT_OUT_DIR" \
     --feedback-tag feedback \
     --no-feedback-tag no_feedback \
-    --bdp-pkts "$RTT_PKTS" \
-    --budget-pkts "$SIRD_CREDIT_BUDGET_PKTS"
+    --bdp-pkts "$BDP_PKTS" \
+    --sample-us "$CREDIT_SAMPLE_US" \
+    --start-sec "$START_SEC"
 fi

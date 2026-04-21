@@ -240,6 +240,38 @@ public:
                                bool senderCsn);
 
   /**
+   * \brief Emit sender-side credit state.
+   * \param sender Sender address owning the credit
+   * \param receiver Receiver address that granted the credit
+   * \param txMsgId Sender-side message ID
+   * \param senderCreditPkts Granted-but-unsent DATA credit held at sender
+   * \param eventType 1=grant-arrived, 2=data-departed, 3=message-cleared
+   */
+  void TraceSirdSenderCreditState (Ipv4Address sender,
+                                   Ipv4Address receiver,
+                                   uint16_t txMsgId,
+                                   uint32_t senderCreditPkts,
+                                   uint8_t eventType);
+
+  /**
+   * \brief Emit receiver-side credit state.
+   * \param receiver Receiver address owning the credit bucket
+   * \param sender Sender address associated with this state
+   * \param receiverAvailPkts Available receiver-global credit in packets
+   * \param receiverBudgetPkts Receiver-global credit budget in packets
+   * \param senderAvailPkts Available per-sender credit in packets
+   * \param senderBudgetPkts Effective per-sender credit budget in packets
+   * \param eventType 1=grant-issued, 2=credit-reclaimed, 0=no-grant
+   */
+  void TraceSirdReceiverCreditState (Ipv4Address receiver,
+                                     Ipv4Address sender,
+                                     uint32_t receiverAvailPkts,
+                                     uint32_t receiverBudgetPkts,
+                                     uint32_t senderAvailPkts,
+                                     uint32_t senderBudgetPkts,
+                                     uint8_t eventType);
+
+  /**
    * \brief Emit a SIRD bucket-state trace record.
    * \param receiver Receiver address owning the bucket state
    * \param sender Source sender address
@@ -468,7 +500,7 @@ private:
   bool m_memIsOptimized; //!< High performant mode (only packet sizes are stored to save from memory)
   
   uint32_t m_mtu; //!< The MTU of the bounded NetDevice
-  uint16_t m_bdp; //!< The number of packets required for full utilization, ie. BDP.
+  uint16_t m_bdp; //!< RTT BDP in packets for Homa's in-flight window baseline.
     
   uint8_t m_numTotalPrioBands;   //!< Total number of priority levels used within the network
   uint8_t m_numUnschedPrioBands; //!< Number of priority bands dedicated for unscheduled packets
@@ -508,6 +540,8 @@ private:
   TracedCallback<Ipv4Address, Ipv4Address, uint16_t, uint16_t, uint16_t,
                  uint8_t, uint8_t, Time> m_pathRttTrace; //!< Trace of {senderIp, receiverIp, srcPort, dstPort, txMsgId, triggerKind, ctrlFlags, pathRtt} for Homa-derived path RTT
   TracedCallback<Ipv4Address, uint16_t, uint16_t, double, double, bool> m_sirdGrantDecisionTrace; //!< Trace of {senderIp, txMsgId, grantOffset, senderBudgetPkts, ecnEwma, csn}
+  TracedCallback<Ipv4Address, Ipv4Address, uint16_t, uint32_t, uint8_t> m_sirdSenderCreditStateTrace; //!< Trace of sender-held SIRD credit
+  TracedCallback<Ipv4Address, Ipv4Address, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdReceiverCreditStateTrace; //!< Trace of receiver-available SIRD credit
   TracedCallback<Ipv4Address, Ipv4Address, double, uint32_t, uint32_t, uint32_t, uint8_t> m_sirdBucketStateTrace; //!< Trace of {receiverIp, senderIp, senderBudgetHostPkts, senderInUsePkts, globalInUsePkts, globalBudgetPkts, eventType}
   TracedCallback<Ipv4Address, Ipv4Address, uint8_t, uint32_t, uint16_t, uint8_t, bool, uint32_t> m_sirdPacketStateTrace; //!< Trace of per-packet SIRD state
   TracedCallback<Ipv4Address, Ipv4Address, double, double, double, double, uint64_t, uint64_t> m_sirdLoopStateTrace; //!< Trace of per-sender SIRD loop state
@@ -669,9 +703,14 @@ public:
 
   /**
    * \brief Get currently accumulated scheduled credit for this message in packets.
-   * \return number of granted-but-unsent scheduled packets
+   * \return sender-held scheduled credit for this message in packets
    */
   uint16_t GetAccumulatedCreditPkts (void) const;
+
+  /**
+   * \brief Consume one sender-held scheduled credit after transmitting DATA.
+   */
+  void ConsumeSenderCredit (void);
   
 private:
   Ipv4Address m_saddr;       //!< Source IP address of this message
@@ -691,6 +730,7 @@ private:
   uint32_t m_maxPayloadSize; //!< Number of bytes that can be stored in packet excluding headers
   uint32_t m_remainingBytes; //!< Remaining number of bytes that are not delivered yet
   uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset received so far (default: BDP)
+  uint16_t m_senderHeldCreditPkts; //!< Sender-held scheduled credit currently available for transmission
   
   uint8_t m_prio;            //!< The most recent priority of the message
   bool m_prioSetByReceiver;  //!< Whether the receiver has specified a priority yet
@@ -976,6 +1016,7 @@ private:
   uint16_t m_maxGrantedIdx;  //!< Highest Grant Offset sent so far
   uint8_t m_prio;            //!< The most recent granted priority set for this message
   bool m_hasGrantedData;     //!< Whether at least one real DATA packet has been granted
+  bool m_creditDrivenGrantWindow; //!< Whether SIRD credit bucket is the only grant-window source
   bool m_currentlyScheduled; //!< Whether this message is prioritized enough to be actively granted
   
   EventId m_rtxEvent;        //!< The EventID for the retransmission timeout

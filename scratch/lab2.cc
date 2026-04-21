@@ -6,12 +6,14 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -30,12 +32,7 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE ("HomaL4ProtocolLab2SenderCongestion");
 
 static Ptr<OutputStreamWrapper> g_creditEventStream;
-static std::map<std::pair<uint32_t, uint32_t>, uint32_t> g_creditsOutstanding;
-static std::map<uint32_t, uint32_t> g_totalCreditsByReceiver;
 static std::vector<uint32_t> g_receiverNodeIds;
-static uint32_t g_targetSenderKey = 0;
-static uint32_t g_bdpPkts = 24;
-static uint32_t g_creditBudgetPkts = 36;
 
 struct SwitchEgressQueueTarget
 {
@@ -174,6 +171,44 @@ TraceSirdBucketState (Ptr<OutputStreamWrapper> stream,
 }
 
 static void
+TraceSirdSenderCreditState (Ptr<OutputStreamWrapper> stream,
+                            Ipv4Address sender,
+                            Ipv4Address receiver,
+                            uint16_t txMsgId,
+                            uint32_t senderCreditPkts,
+                            uint8_t eventType)
+{
+  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                        << " sender=" << sender
+                        << " receiver=" << receiver
+                        << " txMsgId=" << txMsgId
+                        << " senderCreditPkts=" << senderCreditPkts
+                        << " eventType=" << static_cast<uint32_t> (eventType)
+                        << std::endl;
+}
+
+static void
+TraceSirdReceiverCreditState (Ptr<OutputStreamWrapper> stream,
+                              Ipv4Address receiver,
+                              Ipv4Address sender,
+                              uint32_t receiverAvailPkts,
+                              uint32_t receiverBudgetPkts,
+                              uint32_t senderAvailPkts,
+                              uint32_t senderBudgetPkts,
+                              uint8_t eventType)
+{
+  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
+                        << " receiver=" << receiver
+                        << " sender=" << sender
+                        << " receiverAvailPkts=" << receiverAvailPkts
+                        << " receiverBudgetPkts=" << receiverBudgetPkts
+                        << " senderAvailPkts=" << senderAvailPkts
+                        << " senderBudgetPkts=" << senderBudgetPkts
+                        << " eventType=" << static_cast<uint32_t> (eventType)
+                        << std::endl;
+}
+
+static void
 TraceSirdCreditEvent (std::string context,
                       Ipv4Address sender,
                       uint16_t txMsgId,
@@ -183,14 +218,6 @@ TraceSirdCreditEvent (std::string context,
                       bool senderCsn)
 {
   uint32_t recvNode = ExtractNodeId (context);
-  uint32_t senderKey = sender.Get ();
-  if (g_targetSenderKey == 0)
-    {
-      g_targetSenderKey = senderKey;
-    }
-  g_creditsOutstanding[std::make_pair (recvNode, senderKey)]++;
-  g_totalCreditsByReceiver[recvNode]++;
-
   if (g_creditEventStream == 0)
     {
       return;
@@ -220,19 +247,6 @@ TraceDataArrivalCreditEvent (std::string context,
                              uint8_t prio)
 {
   uint32_t recvNode = ExtractNodeId (context);
-  uint32_t senderKey = saddr.Get ();
-  auto key = std::make_pair (recvNode, senderKey);
-  auto outstandingIt = g_creditsOutstanding.find (key);
-  if (outstandingIt != g_creditsOutstanding.end () && outstandingIt->second > 0)
-    {
-      outstandingIt->second--;
-      auto totalIt = g_totalCreditsByReceiver.find (recvNode);
-      if (totalIt != g_totalCreditsByReceiver.end () && totalIt->second > 0)
-        {
-          totalIt->second--;
-        }
-    }
-
   if (g_creditEventStream == 0)
     {
       return;
@@ -248,49 +262,6 @@ TraceDataArrivalCreditEvent (std::string context,
                                      << " prio=" << static_cast<uint32_t> (prio)
                                      << " size=" << packet->GetSize ()
                                      << std::endl;
-}
-
-static void
-SampleCreditSeries (Ptr<OutputStreamWrapper> stream, Time sampleInterval)
-{
-  uint32_t senderAccumPkts = 0;
-  uint32_t receiverAvailPkts = 0;
-
-  for (uint32_t recvNode : g_receiverNodeIds)
-    {
-      if (g_targetSenderKey != 0)
-        {
-          auto it = g_creditsOutstanding.find (std::make_pair (recvNode, g_targetSenderKey));
-          if (it != g_creditsOutstanding.end ())
-            {
-              senderAccumPkts += it->second;
-            }
-        }
-
-      uint32_t totalInUse = 0;
-      auto totalIt = g_totalCreditsByReceiver.find (recvNode);
-      if (totalIt != g_totalCreditsByReceiver.end ())
-        {
-          totalInUse = totalIt->second;
-        }
-      if (g_creditBudgetPkts > totalInUse)
-        {
-          receiverAvailPkts += (g_creditBudgetPkts - totalInUse);
-        }
-    }
-
-  *stream->GetStream () << Simulator::Now ().GetNanoSeconds ()
-                        << " senderAccumPkts=" << senderAccumPkts
-                        << " receiverAvailPkts=" << receiverAvailPkts
-                        << " senderAccumXbdp=" << (static_cast<double> (senderAccumPkts) / g_bdpPkts)
-                        << " receiverAvailXbdp=" << (static_cast<double> (receiverAvailPkts) / g_bdpPkts)
-                        << " targetSender=" << g_targetSenderKey
-                        << std::endl;
-
-  Simulator::Schedule (sampleInterval,
-                       &SampleCreditSeries,
-                       stream,
-                       sampleInterval);
 }
 
 static void
@@ -329,34 +300,32 @@ main (int argc, char* argv[])
   double durationSec = 13.2;
   double settleTailSec = 0.1;
   uint64_t flowGapUs = 4500000;
+  uint64_t sendIntervalUs = 0;
+  uint32_t activeReceiverCount = 3;
   uint32_t msgSizeBytes = 10000000;
 
   bool enableSird = true;
-  bool traceMsg = true;
+  bool traceMsg = false;
+  bool traceProtocolCredit = true;
   bool traceSirdCredit = false;
   bool traceSirdBucket = false;
   bool traceCreditEvents = false;
-  bool traceCreditSeries = true;
   bool traceSwitchEgressQueue = false;
-  uint64_t creditSampleUs = 1000;
   uint64_t switchQueueSampleUs = 1000;
 
-  uint32_t rttPkts = 24;
+  double bdpPkts = 33.32;
   uint8_t numTotalPrioBands = 8;
   uint8_t numUnschedPrioBands = 2;
 
-  uint16_t sirdCreditBudgetPkts = 36;
-  uint16_t sirdUnschThresholdPkts = 24;
   double sirdEcnMdFactor = 0.85;
   double sirdEcnAiStep = 1.0;
   double sirdSenderMdFactor = 0.8;
   double sirdSenderAiStep = 1.0;
   double sirdEcnAlphaGain = 0.125;
-  uint16_t sirdSenderCsnThresholdPkts = 12;
+  uint16_t sirdSenderCsnThresholdPkts = 0;
 
-  std::string deviceQueueMaxSize = "2000p";
+  std::string deviceQueueMaxSize = "17p";
   std::string qdiscMaxSize = "1000p";
-  std::string qdiscMarkThreshold = "0p";
 
   CommandLine cmd (__FILE__);
   cmd.AddValue ("simTag", "Suffix for output trace files", simTag);
@@ -365,35 +334,48 @@ main (int argc, char* argv[])
   cmd.AddValue ("durationSec", "Traffic generation duration in seconds", durationSec);
   cmd.AddValue ("settleTailSec", "Tail time after traffic generation for draining in-flight packets", settleTailSec);
   cmd.AddValue ("flowGapUs", "Start gap between receiver flows in microseconds", flowGapUs);
+  cmd.AddValue ("sendIntervalUs", "Message send interval in microseconds; 0 means line-rate interval from msgSizeBytes", sendIntervalUs);
+  cmd.AddValue ("activeReceiverCount", "Number of receiver flows to start from the lab2 receiver set", activeReceiverCount);
   cmd.AddValue ("msgSizeBytes", "Sender-to-receiver message size", msgSizeBytes);
   cmd.AddValue ("enableSird", "Enable SIRD control path", enableSird);
   cmd.AddValue ("traceMsg", "Whether to trace message begin/finish events", traceMsg);
+  cmd.AddValue ("traceProtocolCredit", "Whether to trace protocol-level sender/receiver credit state", traceProtocolCredit);
   cmd.AddValue ("traceSirdCredit", "Whether to trace SIRD credit/GRANT decisions", traceSirdCredit);
   cmd.AddValue ("traceSirdBucket", "Whether to trace SIRD bucket states", traceSirdBucket);
-  cmd.AddValue ("traceCreditEvents", "Whether to trace grant/data events for Figure 4-style reconstruction", traceCreditEvents);
-  cmd.AddValue ("traceCreditSeries", "Whether to sample compact Figure 4-style credit dynamics", traceCreditSeries);
+  cmd.AddValue ("traceCreditEvents", "Whether to trace legacy grant/data event reconstruction", traceCreditEvents);
   cmd.AddValue ("traceSwitchEgressQueue", "Whether to sample switch egress queue occupancy", traceSwitchEgressQueue);
-  cmd.AddValue ("creditSampleUs", "Compact credit series sampling period in microseconds", creditSampleUs);
   cmd.AddValue ("switchQueueSampleUs", "Switch egress queue sampling interval in microseconds", switchQueueSampleUs);
-  cmd.AddValue ("rttPkts", "Homa RTT packets (BDP approximation)", rttPkts);
-  cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets", sirdCreditBudgetPkts);
-  cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets", sirdUnschThresholdPkts);
+  cmd.AddValue ("bdpPkts", "RTT BDP in packets; all SIRD/Homa thresholds are derived from it", bdpPkts);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
   cmd.AddValue ("sirdEcnAiStep", "SIRD ECN additive increase step", sirdEcnAiStep);
   cmd.AddValue ("sirdSenderMdFactor", "SIRD sender-feedback multiplicative decrease factor", sirdSenderMdFactor);
   cmd.AddValue ("sirdSenderAiStep", "SIRD sender-feedback additive increase step", sirdSenderAiStep);
   cmd.AddValue ("sirdEcnAlphaGain", "SIRD ECN EWMA gain", sirdEcnAlphaGain);
-  cmd.AddValue ("sirdSenderCsnThresholdPkts", "SIRD sender CSN threshold in packets", sirdSenderCsnThresholdPkts);
+  cmd.AddValue ("sirdSenderCsnThresholdPkts", "Optional override for SIRD sender CSN threshold in packets; 0 means derive from bdpPkts", sirdSenderCsnThresholdPkts);
   cmd.AddValue ("deviceQueueMaxSize", "PointToPointNetDevice TxQueue MaxSize", deviceQueueMaxSize);
   cmd.AddValue ("qdiscMaxSize", "SirdQueueDisc MaxSize", qdiscMaxSize);
-  cmd.AddValue ("qdiscMarkThreshold", "SirdQueueDisc ECN mark threshold", qdiscMarkThreshold);
   cmd.Parse (argc, argv);
+
+  auto roundPackets = [] (double value) -> uint16_t {
+    return static_cast<uint16_t> (std::max<long> (1, std::lround (value)));
+  };
+  uint32_t homaBdpPkts = roundPackets (bdpPkts);
+  uint16_t sirdCreditBudgetPkts = roundPackets (1.5 * bdpPkts);
+  uint16_t sirdUnschThresholdPkts = roundPackets (1.0 * bdpPkts);
+  uint16_t derivedSirdSenderCsnThresholdPkts = roundPackets (0.5 * bdpPkts);
+  if (sirdSenderCsnThresholdPkts == 0)
+    {
+      sirdSenderCsnThresholdPkts = derivedSirdSenderCsnThresholdPkts;
+    }
+  std::ostringstream qdiscMarkThresholdBuilder;
+  qdiscMarkThresholdBuilder << roundPackets (1.25 * bdpPkts) << "p";
+  std::string qdiscMarkThreshold = qdiscMarkThresholdBuilder.str ();
 
   Time::SetResolution (Time::NS);
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (rttPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (numTotalPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (numUnschedPrioBands));
   Config::SetDefault ("ns3::HomaL4Protocol::UseSrrScheduling", BooleanValue (false));
@@ -406,9 +388,6 @@ main (int argc, char* argv[])
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderAiStep", DoubleValue (sirdSenderAiStep));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEcnAlphaGain", DoubleValue (sirdEcnAlphaGain));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdSenderCsnThreshold", UintegerValue (sirdSenderCsnThresholdPkts));
-  g_bdpPkts = rttPkts;
-  g_creditBudgetPkts = sirdCreditBudgetPkts;
-
   const uint32_t senderIdx = 0;
   const std::vector<uint32_t> receiverIdx = {1, 2, 3};
   const uint32_t nHosts = 4;
@@ -488,9 +467,23 @@ main (int argc, char* argv[])
                                      MakeBoundCallback (&TraceSirdBucketState, bucketStream));
     }
 
+  if (enableSird && traceProtocolCredit)
+    {
+      Ptr<OutputStreamWrapper> senderCreditStream = ascii.CreateFileStream (prefix.str () + ".sender-credit.tr");
+      Ptr<OutputStreamWrapper> receiverCreditStream = ascii.CreateFileStream (prefix.str () + ".receiver-credit.tr");
+      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/SirdSenderCreditState",
+                                     MakeBoundCallback (&TraceSirdSenderCreditState, senderCreditStream));
+      Config::ConnectWithoutContext ("/NodeList/*/$ns3::HomaL4Protocol/SirdReceiverCreditState",
+                                     MakeBoundCallback (&TraceSirdReceiverCreditState, receiverCreditStream));
+    }
+
   if (enableSird && traceCreditEvents)
     {
       g_creditEventStream = ascii.CreateFileStream (prefix.str () + ".credit-events.tr");
+    }
+
+  if (enableSird && traceCreditEvents)
+    {
       Config::Connect ("/NodeList/*/$ns3::HomaL4Protocol/SirdGrantDecision",
                        MakeCallback (&TraceSirdCreditEvent));
       Config::Connect ("/NodeList/*/$ns3::HomaL4Protocol/DataPktArrival",
@@ -513,8 +506,9 @@ main (int argc, char* argv[])
       switchEgressQueueTargets.push_back ({switchQueueLabel.str (), linkQdiscs[i].Get (1)});
     }
 
+  activeReceiverCount = std::min<uint32_t> (activeReceiverCount, receiverIdx.size ());
   std::vector<InetSocketAddress> receiverAddrs;
-  for (uint32_t i = 0; i < receiverIdx.size (); ++i)
+  for (uint32_t i = 0; i < activeReceiverCount; ++i)
     {
       uint32_t ridx = receiverIdx[i];
       g_receiverNodeIds.push_back (ridx);
@@ -526,19 +520,12 @@ main (int argc, char* argv[])
       receiverAddrs.push_back (addr);
     }
 
-  if (enableSird && traceCreditSeries)
-    {
-      Ptr<OutputStreamWrapper> creditSeriesStream = ascii.CreateFileStream (prefix.str () + ".credit-series.tr");
-      Simulator::Schedule (MicroSeconds (creditSampleUs),
-                           &SampleCreditSeries,
-                           creditSeriesStream,
-                           MicroSeconds (creditSampleUs));
-    }
-
   Time startTime = Seconds (startSec);
   Time stopTime = Seconds (startSec + durationSec);
   Time simStopTime = Seconds (startSec + durationSec + settleTailSec);
-  Time msgInterval = Seconds ((static_cast<double> (msgSizeBytes) * 8.0) / 100e9);
+  Time msgInterval = sendIntervalUs == 0 ?
+    Seconds ((static_cast<double> (msgSizeBytes) * 8.0) / 100e9) :
+    MicroSeconds (sendIntervalUs);
   Time flowGap = MicroSeconds (flowGapUs);
 
   if (traceSwitchEgressQueue)

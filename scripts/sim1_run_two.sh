@@ -15,12 +15,13 @@ MAX_SETTLE_RETRIES="${MAX_SETTLE_RETRIES:-3}"
 SETTLE_TAIL_MULTIPLIER="${SETTLE_TAIL_MULTIPLIER:-2}"
 QUEUE_SAMPLE_US="${QUEUE_SAMPLE_US:-100}"
 GOODPUT_SAMPLE_US="${GOODPUT_SAMPLE_US:-100}"
-TRACE_MSG="${TRACE_MSG:-1}"
-TRACE_TOR_QUEUE="${TRACE_TOR_QUEUE:-1}"
+TRACE_MSG="${TRACE_MSG:-0}"
+TRACE_TOR_QUEUE="${TRACE_TOR_QUEUE:-0}"
 TRACE_GOODPUT="${TRACE_GOODPUT:-1}"
-DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-2000p}"
+BDP_PKTS="${BDP_PKTS:-66.67}"
+DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-17p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
-QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-120p}"
+QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-$(awk "BEGIN { printf \"%dp\", (1.25 * $BDP_PKTS) + 0.5 }")}"
 SUMMARY_FILE="${SUMMARY_FILE:-$TRACE_DIR/sim1_matrix_summary.csv}"
 ENFORCE_MSG_COMPLETE="${ENFORCE_MSG_COMPLETE:-0}"
 
@@ -62,6 +63,7 @@ run_case() {
       "--traceGoodput=$TRACE_GOODPUT" \
       "--queueSampleUs=$QUEUE_SAMPLE_US" \
       "--goodputSampleUs=$GOODPUT_SAMPLE_US" \
+      "--bdpPkts=$BDP_PKTS" \
       "--deviceQueueMaxSize=$DEVICE_QUEUE_MAX_SIZE" \
       "--qdiscMaxSize=$QDISC_MAX_SIZE" \
       "--qdiscMarkThreshold=$QDISC_MARK_THRESHOLD" >>"$log_file" 2>&1
@@ -97,8 +99,13 @@ run_case() {
 
 pids=()
 read -r -a traffic_configs <<< "$TRAFFIC_CONFIGS"
-workload_tags=(dctcp facebook_hadoop)
-workload_files=(inputs/DCTCP-MsgSizeDist.txt inputs/Facebook_HadoopDist_All.txt)
+workload_tags=(dctcp)
+workload_files=(inputs/homa-paper-reproduction/DCTCP-MsgSizeDist.txt)
+
+if [[ -f inputs/Facebook_HadoopDist_All.txt ]]; then
+  workload_tags+=(facebook_hadoop)
+  workload_files+=(inputs/Facebook_HadoopDist_All.txt)
+fi
 
 for traffic_config in "${traffic_configs[@]}"; do
   for idx in "${!workload_tags[@]}"; do

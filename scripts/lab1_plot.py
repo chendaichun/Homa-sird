@@ -251,6 +251,23 @@ def parse_receiver_throughput(path: Path) -> List[Tuple[float, float]]:
     return rows
 
 
+def parse_all_link_throughput(path: Path) -> Dict[str, List[Tuple[float, float]]]:
+    rows: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    if not path.exists():
+        return rows
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            time_ns, values = parse_kv_line(line)
+            if time_ns is None:
+                continue
+            try:
+                rows[values["link"]].append((time_ns / 1e9, float(values["instGbps"])))
+            except (KeyError, ValueError):
+                continue
+    return rows
+
+
 def parse_sird_loop_trace(path: Path) -> List[SirdLoopSample]:
     rows: List[SirdLoopSample] = []
     if not path.exists():
@@ -520,6 +537,41 @@ def plot_receiver_throughput(
     plt.close()
 
 
+def plot_all_link_throughput(
+    trace_dir: Path,
+    out_dir: Path,
+    tags: List[str],
+    start_sec: Optional[float],
+) -> None:
+    for tag in tags:
+        by_link = parse_all_link_throughput(trace_dir / f"lab1_{tag}.link-throughput.tr")
+        if not by_link:
+            continue
+
+        plt.figure(figsize=(10.5, 5.8))
+        plotted = False
+        for link in sorted(by_link):
+            rows = trim_time(by_link[link], start_sec)
+            if not rows:
+                continue
+            plotted = True
+            xs, ys = zip(*rows)
+            plt.plot(xs, ys, label=link, linewidth=1.2)
+
+        if not plotted:
+            plt.close()
+            continue
+
+        plt.xlabel("Time since traffic start (s)" if start_sec is not None else "Time (s)")
+        plt.ylabel("Throughput (Gbps)")
+        plt.title(f"All link throughput {infer_label(tag)}")
+        plt.grid(True, alpha=0.25)
+        plt.legend(fontsize=7, ncol=2)
+        plt.tight_layout()
+        plt.savefig(out_dir / f"lab1_all_links_throughput_{tag}.png", dpi=200)
+        plt.close()
+
+
 def write_summary(trace_dir: Path, out_dir: Path, tags: List[str], sizes: List[int]) -> None:
     lines: List[str] = []
     lines.append("tag,size,started,finished,incomplete,count,p50_us,p99_us,mean_us")
@@ -585,6 +637,7 @@ def main() -> int:
     plot_queue_timeseries(trace_dir, out_dir, tags, args.start_sec)
     plot_queue_cdf(trace_dir, out_dir, tags)
     plot_receiver_throughput(trace_dir, out_dir, tags, args.start_sec)
+    plot_all_link_throughput(trace_dir, out_dir, tags, args.start_sec)
     plot_sender_sird_loop(trace_dir, out_dir, tags, args.start_sec, args.sird_loop_window_us)
     write_summary(trace_dir, out_dir, tags, sizes)
 

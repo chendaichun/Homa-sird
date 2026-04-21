@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -241,22 +242,23 @@ main (int argc, char* argv[])
   std::string torSpineDelay = "1us";
 
   uint32_t appPort = 30000;
-  uint32_t rttPkts = 24;
-  uint16_t sirdCreditBudgetPkts = 36;
-  uint16_t sirdUnschThresholdPkts = 24;
+  double bdpPkts = 66.67;
+  uint32_t homaBdpPktsOverride = 0;
+  uint16_t sirdCreditBudgetPktsOverride = 0;
+  uint16_t sirdUnschThresholdPktsOverride = 0;
   double sirdEcnMdFactor = 0.85;
   double sirdEcnAiStep = 1.0;
   double sirdSenderMdFactor = 0.8;
   double sirdSenderAiStep = 1.0;
   double sirdEcnAlphaGain = 0.125;
-  uint16_t sirdSenderCsnThresholdPkts = 12;
+  uint16_t sirdSenderCsnThresholdPktsOverride = 0;
 
-  std::string deviceQueueMaxSize = "2000p";
+  std::string deviceQueueMaxSize = "17p";
   std::string qdiscMaxSize = "1000p";
-  std::string qdiscMarkThreshold = "120p";
+  std::string qdiscMarkThreshold = "auto";
 
-  bool traceMsg = true;
-  bool traceTorQueue = true;
+  bool traceMsg = false;
+  bool traceTorQueue = false;
   bool traceGoodput = true;
   uint64_t queueSampleUs = 100;
   uint64_t goodputSampleUs = 100;
@@ -289,15 +291,16 @@ main (int argc, char* argv[])
   cmd.AddValue ("incastLoadFraction", "Aggregate incast overlay load fraction relative to total background offered load", incastLoadFraction);
   cmd.AddValue ("incastReceiverIdx", "Receiver host index for incast; negative chooses random receiver", incastReceiverIdx);
   cmd.AddValue ("incastSeed", "Seed for deterministic incast sender/receiver selection", incastSeed);
-  cmd.AddValue ("rttPkts", "Homa RTT packets (BDP approximation)", rttPkts);
-  cmd.AddValue ("sirdCreditBudgetPkts", "SIRD global credit budget in packets", sirdCreditBudgetPkts);
-  cmd.AddValue ("sirdUnschThresholdPkts", "SIRD unscheduled threshold in packets", sirdUnschThresholdPkts);
+  cmd.AddValue ("bdpPkts", "RTT BDP in packets; default 66.67 for cross-ToR leaf-spine paths", bdpPkts);
+  cmd.AddValue ("rttPkts", "Optional override for HomaL4Protocol::RttPackets; 0 derives from bdpPkts", homaBdpPktsOverride);
+  cmd.AddValue ("sirdCreditBudgetPkts", "Optional override for SIRD global credit budget; 0 derives 1.5*bdpPkts", sirdCreditBudgetPktsOverride);
+  cmd.AddValue ("sirdUnschThresholdPkts", "Optional override for SIRD unscheduled threshold; 0 derives 1.0*bdpPkts", sirdUnschThresholdPktsOverride);
   cmd.AddValue ("sirdEcnMdFactor", "SIRD ECN multiplicative decrease factor", sirdEcnMdFactor);
   cmd.AddValue ("sirdEcnAiStep", "SIRD ECN additive increase step", sirdEcnAiStep);
   cmd.AddValue ("sirdSenderMdFactor", "SIRD sender-feedback multiplicative decrease factor", sirdSenderMdFactor);
   cmd.AddValue ("sirdSenderAiStep", "SIRD sender-feedback additive increase step", sirdSenderAiStep);
   cmd.AddValue ("sirdEcnAlphaGain", "SIRD ECN EWMA gain", sirdEcnAlphaGain);
-  cmd.AddValue ("sirdSenderCsnThresholdPkts", "SIRD sender CSN threshold in packets", sirdSenderCsnThresholdPkts);
+  cmd.AddValue ("sirdSenderCsnThresholdPkts", "Optional override for SIRD sender CSN threshold; 0 derives 0.5*bdpPkts", sirdSenderCsnThresholdPktsOverride);
   cmd.AddValue ("deviceQueueMaxSize", "PointToPointNetDevice TxQueue MaxSize", deviceQueueMaxSize);
   cmd.AddValue ("qdiscMaxSize", "SirdQueueDisc MaxSize", qdiscMaxSize);
   cmd.AddValue ("qdiscMarkThreshold", "SirdQueueDisc ECN mark threshold", qdiscMarkThreshold);
@@ -314,6 +317,27 @@ main (int argc, char* argv[])
   if (incastLoadFraction < 0.0 || incastLoadFraction >= 1.0)
     {
       NS_FATAL_ERROR ("incastLoadFraction must be in [0, 1).");
+    }
+  if (bdpPkts <= 0.0)
+    {
+      NS_FATAL_ERROR ("bdpPkts must be positive.");
+    }
+
+  auto roundPackets = [] (double value) -> uint16_t {
+    return static_cast<uint16_t> (std::max<long> (1, std::lround (value)));
+  };
+  uint32_t homaBdpPkts = homaBdpPktsOverride == 0 ? roundPackets (bdpPkts) : homaBdpPktsOverride;
+  uint16_t sirdCreditBudgetPkts =
+    sirdCreditBudgetPktsOverride == 0 ? roundPackets (1.5 * bdpPkts) : sirdCreditBudgetPktsOverride;
+  uint16_t sirdUnschThresholdPkts =
+    sirdUnschThresholdPktsOverride == 0 ? roundPackets (1.0 * bdpPkts) : sirdUnschThresholdPktsOverride;
+  uint16_t sirdSenderCsnThresholdPkts =
+    sirdSenderCsnThresholdPktsOverride == 0 ? roundPackets (0.5 * bdpPkts) : sirdSenderCsnThresholdPktsOverride;
+  if (qdiscMarkThreshold == "auto")
+    {
+      std::ostringstream markThreshold;
+      markThreshold << roundPackets (1.25 * bdpPkts) << "p";
+      qdiscMarkThreshold = markThreshold.str ();
     }
 
   if (trafficConfig == "balanced")
@@ -356,7 +380,7 @@ main (int argc, char* argv[])
   SeedManager::SetRun (1);
 
   Config::SetDefault ("ns3::Ipv4GlobalRouting::EcmpMode", EnumValue (Ipv4GlobalRouting::ECMP_RANDOM));
-  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (rttPkts));
+  Config::SetDefault ("ns3::HomaL4Protocol::RttPackets", UintegerValue (homaBdpPkts));
   Config::SetDefault ("ns3::HomaL4Protocol::NumTotalPrioBands", UintegerValue (8));
   Config::SetDefault ("ns3::HomaL4Protocol::NumUnschedPrioBands", UintegerValue (2));
   Config::SetDefault ("ns3::HomaL4Protocol::SirdEnabled", BooleanValue (enableSird));

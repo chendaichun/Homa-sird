@@ -128,7 +128,7 @@ HomaL4Protocol::GetTypeId (void)
                    ObjectVectorValue (),
                    MakeObjectVectorAccessor (&HomaL4Protocol::m_sockets),
                    MakeObjectVectorChecker<HomaSocket> ())
-    .AddAttribute ("RttPackets", "The number of packets required for full utilization, ie. BDP.",
+    .AddAttribute ("RttPackets", "RTT BDP in packets for Homa's in-flight window baseline.",
                    UintegerValue (10),
                    MakeUintegerAccessor (&HomaL4Protocol::m_bdp),
                    MakeUintegerChecker<uint16_t> ())
@@ -239,6 +239,14 @@ HomaL4Protocol::GetTypeId (void)
                      "Trace source for SIRD grant decisions.",
                      MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdGrantDecisionTrace),
                      "ns3::TracedCallback")//上面 3 个 trace 已经弃用
+    .AddTraceSource ("SirdSenderCreditState",
+                     "Trace source for sender-side held SIRD credit.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdSenderCreditStateTrace),
+                     "ns3::TracedCallback")
+    .AddTraceSource ("SirdReceiverCreditState",
+                     "Trace source for receiver-side available SIRD credit.",
+                     MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdReceiverCreditStateTrace),
+                     "ns3::TracedCallback")
     .AddTraceSource ("SirdBucketState",
                      "Trace source for SIRD per-sender/global bucket state.",
                      MakeTraceSourceAccessor (&HomaL4Protocol::m_sirdBucketStateTrace),
@@ -448,6 +456,38 @@ HomaL4Protocol::TraceSirdGrantDecision (Ipv4Address sender,
                             senderBudgetPkts,
                             ecnEwma,
                             senderCsn);
+}
+
+void
+HomaL4Protocol::TraceSirdSenderCreditState (Ipv4Address sender,
+                                            Ipv4Address receiver,
+                                            uint16_t txMsgId,
+                                            uint32_t senderCreditPkts,
+                                            uint8_t eventType)
+{
+  m_sirdSenderCreditStateTrace (sender,
+                                receiver,
+                                txMsgId,
+                                senderCreditPkts,
+                                eventType);
+}
+
+void
+HomaL4Protocol::TraceSirdReceiverCreditState (Ipv4Address receiver,
+                                              Ipv4Address sender,
+                                              uint32_t receiverAvailPkts,
+                                              uint32_t receiverBudgetPkts,
+                                              uint32_t senderAvailPkts,
+                                              uint32_t senderBudgetPkts,
+                                              uint8_t eventType)
+{
+  m_sirdReceiverCreditStateTrace (receiver,
+                                  sender,
+                                  receiverAvailPkts,
+                                  receiverBudgetPkts,
+                                  senderAvailPkts,
+                                  senderBudgetPkts,
+                                  eventType);
 }
 
 void
@@ -1043,6 +1083,7 @@ HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message,
                                   uint16_t sport, uint16_t dport, 
                                   Ptr<HomaL4Protocol> homa)
     : m_route(0),
+      m_senderHeldCreditPkts(0),
       m_prio(0),
       m_prioSetByReceiver(false),
   m_waitForFirstGrant(false),
@@ -1113,6 +1154,11 @@ HomaOutboundMsg::HomaOutboundMsg (Ptr<Packet> message,
   {
     m_maxGrantedIdx = std::min((uint16_t)(m_homa->GetBdp () -1), numPkts);
   }
+
+  if (!m_waitForFirstGrant && numPkts > 0)
+    {
+      m_senderHeldCreditPkts = std::min<uint16_t> (static_cast<uint16_t> (m_maxGrantedIdx + 1), numPkts);
+    }
           
   // FIX: There is no timeout mechanism on the sender side for Homa 
   //      (even for garbage collection purposes), so removing the following
@@ -1308,24 +1354,16 @@ Ptr<Packet> HomaOutboundMsg::RemoveNextPktFromTxQ (uint16_t pktOffset)
 uint16_t
 HomaOutboundMsg::GetAccumulatedCreditPkts (void) const
 {
-  if (m_waitForFirstGrant || m_pktTxQ.empty ())
-    {
-      return 0;
-    }
+  return m_senderHeldCreditPkts;
+}
 
-  uint16_t nextPktOffset = m_pktTxQ.top ();
-  uint16_t msgSizePkts = m_msgSizeBytes / m_maxPayloadSize + (m_msgSizeBytes % m_maxPayloadSize != 0);
-  if (msgSizePkts == 0)
+void
+HomaOutboundMsg::ConsumeSenderCredit (void)
+{
+  if (m_senderHeldCreditPkts > 0)
     {
-      return 0;
+      m_senderHeldCreditPkts--;
     }
-
-  uint16_t highestGranted = std::min<uint16_t> (m_maxGrantedIdx, static_cast<uint16_t> (msgSizePkts - 1));
-  if (nextPktOffset > highestGranted)
-    {
-      return 0;
-    }
-  return highestGranted - nextPktOffset + 1;
 }
     
 /*
@@ -1344,6 +1382,9 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
   NS_ASSERT_MSG(grantOffset < this->GetMsgSizePkts (), 
                 "HomaOutboundMsg shouldn't be granted after it is already fully granted!");
   
+  bool wasWaitingForFirstGrant = m_waitForFirstGrant;
+  uint16_t prevGrantedPkts = wasWaitingForFirstGrant ? 0 :
+    std::min<uint16_t> (static_cast<uint16_t> (m_maxGrantedIdx + 1), this->GetMsgSizePkts ());
   bool firstGrant = m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx;
   if (m_waitForFirstGrant && grantOffset >= m_maxGrantedIdx)
   {
@@ -1385,6 +1426,13 @@ void HomaOutboundMsg::HandleGrantOffset (HomaHeader const &homaHeader)
     NS_LOG_LOGIC("HomaOutboundMsg (" << this 
                  << ") has received an out-of-order Grant. State is not updated!");
   }
+
+  uint16_t newGrantedPkts = m_waitForFirstGrant ? 0 :
+    std::min<uint16_t> (static_cast<uint16_t> (m_maxGrantedIdx + 1), this->GetMsgSizePkts ());
+  if (newGrantedPkts > prevGrantedPkts)
+    {
+      m_senderHeldCreditPkts += (newGrantedPkts - prevGrantedPkts);
+    }
 }
     
 // 处理 RESEND 请求：将缺失分片重新入队，并在必要时提升授权上界。
@@ -1425,6 +1473,7 @@ void HomaOutboundMsg::HandleAck (HomaHeader const &homaHeader)
     
   NS_ASSERT(homaHeader.GetPktOffset () == this->GetMsgSizePkts ());
   m_remainingBytes = 0;
+  m_senderHeldCreditPkts = 0;
 }
     
 // 构造 BUSY 控制包，告知对端当前发送端暂不可立即服务该消息。
@@ -1693,6 +1742,16 @@ bool HomaSendScheduler::GetNextPktOfMsg (uint16_t txMsgId, Ptr<Packet> &p)
     p->AddHeader (homaHeader);
     NS_LOG_DEBUG (Simulator::Now ().GetNanoSeconds () << 
                   " HomaL4Protocol sending: " << p->ToString ());
+
+    if (m_homa->IsSirdEnabled ())
+    {
+      candidateMsg->ConsumeSenderCredit ();
+      m_homa->TraceSirdSenderCreditState (candidateMsg->GetSrcAddress (),
+                                          candidateMsg->GetDstAddress (),
+                                          txMsgId,
+                                          candidateMsg->GetAccumulatedCreditPkts (),
+                                          2);
+    }
     
     return true;
   }
@@ -1739,7 +1798,14 @@ HomaSendScheduler::TxDataPacket ()
   Ptr<Packet> p;
   if (this->GetNextMsgId (nextTxMsgID))
   {   
-    NS_ASSERT(this->GetNextPktOfMsg(nextTxMsgID, p));
+    bool gotPkt = this->GetNextPktOfMsg(nextTxMsgID, p);
+    NS_ASSERT(gotPkt);
+    if (!gotPkt)
+    {
+      NS_LOG_LOGIC("HomaSendScheduler selected msg " << nextTxMsgID
+                   << " but no packet was available.");
+      return;
+    }
       
     NS_LOG_LOGIC("HomaSendScheduler (" << this <<
                   ") will transmit a packet from msg " << nextTxMsgID);
@@ -1801,10 +1867,20 @@ void HomaSendScheduler::CtrlPktRecvdForOutboundMsg(Ipv4Header const &ipv4Header,
   if (ctrlFlag & HomaHeader::Flags_t::GRANT)
   {
     targetMsg->HandleGrantOffset (homaHeader);
+    m_homa->TraceSirdSenderCreditState (targetMsg->GetSrcAddress (),
+                                        targetMsg->GetDstAddress (),
+                                        targetTxMsgId,
+                                        targetMsg->GetAccumulatedCreditPkts (),
+                                        1);
   }
   else if (ctrlFlag & HomaHeader::Flags_t::RESEND)
   {
     targetMsg->HandleGrantOffset (homaHeader);
+    m_homa->TraceSirdSenderCreditState (targetMsg->GetSrcAddress (),
+                                        targetMsg->GetDstAddress (),
+                                        targetTxMsgId,
+                                        targetMsg->GetAccumulatedCreditPkts (),
+                                        1);
     targetMsg->HandleResend (homaHeader);
       
     uint16_t nextTxMsgID;
@@ -1826,6 +1902,11 @@ void HomaSendScheduler::CtrlPktRecvdForOutboundMsg(Ipv4Header const &ipv4Header,
     NS_LOG_LOGIC("The HomaOutboundMsg (" << targetMsg << ") is fully delivered!");
     
     targetMsg->HandleAck (homaHeader); // Asserts some sanity checks.
+    m_homa->TraceSirdSenderCreditState (targetMsg->GetSrcAddress (),
+                                        targetMsg->GetDstAddress (),
+                                        targetTxMsgId,
+                                        0,
+                                        3);
     this->ClearStateForMsg (targetTxMsgId);
   }
   else
@@ -1887,6 +1968,7 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
                                 bool sirdEnabled, uint16_t sirdUnschThresholdPkts)
     : m_prio(0),
       m_hasGrantedData(false),
+      m_creditDrivenGrantWindow(false),
       m_currentlyScheduled(false),
       m_numRtxWithoutProgress (0)
 {
@@ -1935,6 +2017,7 @@ HomaInboundMsg::HomaInboundMsg (Ptr<Packet> p,
     m_maxGrantedIdx = 0;
     m_maxGrantableIdx = 0;
     m_hasGrantedData = false;
+    m_creditDrivenGrantWindow = true;
   }
   else
   {
@@ -2157,10 +2240,12 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
      * is upto the HomaRecvScheduler to decide whether to send a Grant packet 
      * to the sender of this message or not.
      */
-    if (m_maxGrantableIdx < m_msgSizePkts - 1)
+    if (m_creditDrivenGrantWindow || m_maxGrantableIdx >= m_msgSizePkts - 1)
     {
-      m_maxGrantableIdx++;
+      return;
     }
+
+    m_maxGrantableIdx++;
   }
   else
   {
@@ -2170,7 +2255,7 @@ void HomaInboundMsg::ReceiveDataPacket (Ptr<Packet> p, uint16_t pktOffset)
     // TODO: Insert a trace source to keep track of spurious retransmissions.
   }
 }
-    
+
 // 在消息完整后执行重组，返回可直接上交应用层的完整 Packet。
 Ptr<Packet> HomaInboundMsg::GetReassembledMsg ()
 {
@@ -2412,6 +2497,19 @@ void HomaRecvScheduler::ReceivePacket (Ptr<Packet> packet,
           }
 
           const uint32_t globalBudgetPkts = std::max<uint32_t> (1, m_homa->GetSirdCreditBudgetPkts ());
+          uint32_t senderBudgetPkts = static_cast<uint32_t> (std::max (1.0, hostBudgetPkts));
+          uint32_t senderAvailPkts =
+            (senderBudgetPkts > inUseIt->second) ? (senderBudgetPkts - inUseIt->second) : 0;
+          uint32_t globalAvailPkts =
+            (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+            (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+          m_homa->TraceSirdReceiverCreditState (ipv4Header.GetDestination (),
+                                                Ipv4Address (senderKey),
+                                                globalAvailPkts,
+                                                globalBudgetPkts,
+                                                senderAvailPkts,
+                                                senderBudgetPkts,
+                                                2);
           m_homa->TraceSirdBucketState (ipv4Header.GetDestination (),
                                         Ipv4Address (senderKey),
                                         hostBudgetPkts,
@@ -2827,10 +2925,21 @@ bool HomaRecvScheduler::SendAppropriateGrants()
             currentMsg->SetCurrentlyScheduled(true);
             m_sirdSenderCreditsInUsePkts[senderKey]++;
             m_sirdGlobalCreditsInUsePkts++;
+            senderInUsePkts = m_sirdSenderCreditsInUsePkts[senderKey];
             issuedThisRound = true;
             grantIssued = true;
           }
 
+	          senderAvailPkts = (senderBudgetPkts > senderInUsePkts) ? (senderBudgetPkts - senderInUsePkts) : 0;
+	          globalAvailPkts = (globalBudgetPkts > m_sirdGlobalCreditsInUsePkts) ?
+	                            (globalBudgetPkts - m_sirdGlobalCreditsInUsePkts) : 0;
+	          m_homa->TraceSirdReceiverCreditState (currentMsg->GetDstAddress (),
+	                                                senderAddress,
+	                                                globalAvailPkts,
+	                                                globalBudgetPkts,
+	                                                senderAvailPkts,
+	                                                senderBudgetPkts,
+	                                                issuedThisRound ? 1 : 0);
 	          m_homa->TraceSirdBucketState (currentMsg->GetDstAddress (),
 	                                        senderAddress,
 	                                        hostBudget,

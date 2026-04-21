@@ -10,13 +10,14 @@ START_SEC="${START_SEC:-0.2}"
 DURATION_SEC="${DURATION_SEC:-0.005}"
 SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC:-0.02}"
 SHORT_INTERVAL_8B_US="${SHORT_INTERVAL_8B_US:-1}"
-SHORT_INTERVAL_500KB_US="${SHORT_INTERVAL_500KB_US:-50}"
+SHORT_INTERVAL_500KB_US="${SHORT_INTERVAL_500KB_US:-500}"
+TARGET_PROBE_MESSAGES="${TARGET_PROBE_MESSAGES:-0}"
 
-if [[ "$PROFILE" == "full" ]]; then
-  DURATION_SEC="${DURATION_SEC_FULL:-0.03}"
-  SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC_FULL:-0.03}"
+if [[ "$PROFILE" == "last" ]]; then
+  TARGET_PROBE_MESSAGES="${TARGET_PROBE_MESSAGES_LAST:-500}"
+  SETTLE_TAIL_SEC="${SETTLE_TAIL_SEC_LAST:-0.3}"
 elif [[ "$PROFILE" != "fast" ]]; then
-  echo "Usage: bash scripts/lab1.sh [fast|full]"
+  echo "Usage: bash scripts/lab1.sh [fast|last]"
   exit 2
 fi
 
@@ -33,12 +34,18 @@ ENFORCE_MSG_COMPLETE="${ENFORCE_MSG_COMPLETE:-0}"
 MAX_SETTLE_RETRIES="${MAX_SETTLE_RETRIES:-4}"
 SETTLE_TAIL_MULTIPLIER="${SETTLE_TAIL_MULTIPLIER:-2}"
 
-BDP_PKTS="${BDP_PKTS:-16.6}"
-DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-1000p}"
+BDP_PKTS="${BDP_PKTS:-33.32}"
+DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-17p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
 
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/outputs/sird-scenarios/HomaL4Protocol-lab1-receiver-congestion}"
-PLOT_OUT_DIR="${PLOT_OUT_DIR:-$ROOT_DIR/output-f/lab1}"
+if [[ -z "${OUT_DIR+x}" ]]; then
+  OUT_DIR="outputs/sird-scenarios/HomaL4Protocol-lab1-receiver-congestion"
+fi
+if [[ "$OUT_DIR" == *" "* ]]; then
+  echo "OUT_DIR must not contain spaces because ns-3 trace output parsing truncates such paths: $OUT_DIR"
+  exit 2
+fi
+PLOT_OUT_DIR="${PLOT_OUT_DIR:-$OUT_DIR/plots}"
 mkdir -p "$OUT_DIR"
 
 export LD_LIBRARY_PATH="$ROOT_DIR/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -59,7 +66,6 @@ COMMON_ARGS=(
   "--enableSird=$ENABLE_SIRD"
   "--outputDir=$OUT_DIR"
   "--startSec=$START_SEC"
-  "--durationSec=$DURATION_SEC"
   "--longMsgSizeBytes=$LONG_MSG_SIZE_BYTES"
   "--longSenderRateGbps=$LONG_SENDER_RATE_GBPS"
   "--bdpPkts=$BDP_PKTS"
@@ -84,7 +90,13 @@ run_case() {
   local tag="lab1_${PROFILE}_${CC_LABEL}_${label}"
   local log_file="$OUT_DIR/${tag}.run.log"
   local settle_tail_sec="$SETTLE_TAIL_SEC"
+  local target_probe_messages="$TARGET_PROBE_MESSAGES"
+  local duration_sec="$DURATION_SEC"
   local attempt=1
+
+  if [[ "$target_probe_messages" -gt 0 ]]; then
+    duration_sec=$(awk -v n="$target_probe_messages" -v us="$short_interval_us" 'BEGIN {printf "%.9f", n * us / 1000000.0}')
+  fi
 
   while true; do
     rm -f \
@@ -94,11 +106,13 @@ run_case() {
       "$OUT_DIR/lab1_${tag}.switch-egress-queue.tr" \
       "$OUT_DIR/lab1_${tag}.sird-credit.tr"
 
-    echo "[$tag] attempt=$attempt settleTailSec=$settle_tail_sec shortIntervalUs=$short_interval_us start $(date '+%F %T')" | tee "$log_file"
+    echo "[$tag] attempt=$attempt durationSec=$duration_sec settleTailSec=$settle_tail_sec shortIntervalUs=$short_interval_us targetProbeMessages=$target_probe_messages start $(date '+%F %T')" | tee "$log_file"
     "$BIN_PATH" \
       "--simTag=$tag" \
       "--shortMsgSizeBytes=$probe_size" \
       "--shortIntervalUs=$short_interval_us" \
+      "--durationSec=$duration_sec" \
+      "--targetProbeMessages=$target_probe_messages" \
       "--enableBackgroundTraffic=$enable_background" \
       "--useSrrScheduling=$use_srr" \
       "--settleTailSec=$settle_tail_sec" \
@@ -133,7 +147,7 @@ run_case() {
   done
 }
 
-echo "profile=$PROFILE enableSird=$ENABLE_SIRD durationSec=$DURATION_SEC settleTailSec=$SETTLE_TAIL_SEC"
+echo "profile=$PROFILE enableSird=$ENABLE_SIRD durationSec=$DURATION_SEC settleTailSec=$SETTLE_TAIL_SEC targetProbeMessages=$TARGET_PROBE_MESSAGES"
 echo "outputs: $OUT_DIR"
 
 pids=()
