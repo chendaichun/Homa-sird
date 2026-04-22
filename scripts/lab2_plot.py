@@ -3,6 +3,7 @@
 
 Expected input files are produced by scripts/lab2.sh through
 scratch/lab2.cc:
+  lab2_<tag>.credit-sample.tr
   lab2_<tag>.sender-credit.tr
   lab2_<tag>.receiver-credit.tr
   lab2_<tag>.switch-egress-queue.tr (optional)
@@ -21,6 +22,7 @@ import matplotlib.pyplot as plt
 
 
 Event = Tuple[int, str, int, str]
+CreditSample = Tuple[int, str, float, float]
 SenderCreditEvent = Tuple[int, str, str, int, int]
 ReceiverCreditEvent = Tuple[int, str, str, int, int, int, int]
 
@@ -60,6 +62,35 @@ def parse_credit_events(path: Path) -> List[Event]:
 
     events.sort(key=lambda row: row[0])
     return events
+
+
+def parse_credit_sample(path: Path) -> List[CreditSample]:
+    rows: List[CreditSample] = []
+    if not path.exists():
+        return rows
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                time_ns = int(parts[0])
+            except ValueError:
+                continue
+            fields = parse_kv_fields(parts[1:])
+            required = {"sender", "senderCreditXbdp", "receiverAvailXbdp"}
+            if not required.issubset(fields):
+                continue
+            try:
+                sender_credit_xbdp = float(fields["senderCreditXbdp"])
+                receiver_avail_xbdp = float(fields["receiverAvailXbdp"])
+            except ValueError:
+                continue
+            rows.append((time_ns, fields["sender"], sender_credit_xbdp, receiver_avail_xbdp))
+
+    rows.sort(key=lambda row: row[0])
+    return rows
 
 
 def parse_sender_credit(path: Path) -> List[SenderCreditEvent]:
@@ -175,6 +206,39 @@ def pick_target_sender(
     if not senders:
         return None
     return senders.most_common(1)[0][0]
+
+
+def derive_credit_series_from_samples(
+    samples: List[CreditSample],
+    dt_s: float,
+    ma_s: float,
+    start_sec: Optional[float] = None,
+) -> Optional[Tuple[List[float], List[float], List[float], str, List[int]]]:
+    if not samples:
+        return None
+
+    target_sender = Counter(row[1] for row in samples).most_common(1)[0][0]
+    filtered = [row for row in samples if row[1] == target_sender]
+    if not filtered:
+        return None
+
+    start_ns = int(start_sec * 1e9) if start_sec is not None else filtered[0][0]
+    filtered = [row for row in filtered if row[0] >= start_ns]
+    if not filtered:
+        return None
+
+    xs = [row[0] / 1e9 for row in filtered]
+    sender_credit_xbdp = [row[2] for row in filtered]
+    receiver_avail_xbdp = [row[3] for row in filtered]
+
+    ma_window = max(1, int(round(ma_s / dt_s)))
+    return (
+        xs,
+        moving_average(sender_credit_xbdp, ma_window),
+        moving_average(receiver_avail_xbdp, ma_window),
+        target_sender,
+        [],
+    )
 
 
 def derive_credit_series_from_protocol_traces(
@@ -388,6 +452,26 @@ def pick_sender(rows: Dict[str, List[Tuple[float, float, int]]]) -> Optional[str
     return max(rows.keys(), key=lambda sender: len(rows[sender]))
 
 
+def apply_start_padding(ax: plt.Axes, xs_sets: Iterable[List[float]], start_sec: Optional[float]) -> None:
+    if start_sec is None:
+        return
+
+    xmax: Optional[float] = None
+    for xs in xs_sets:
+        visible = [x for x in xs if x >= start_sec]
+        if not visible:
+            continue
+        series_max = max(visible)
+        xmax = series_max if xmax is None else max(xmax, series_max)
+
+    if xmax is None or xmax <= start_sec:
+        ax.set_xlim(left=start_sec)
+        return
+
+    pad = (xmax - start_sec) / 15.0
+    ax.set_xlim(left=start_sec - pad, right=xmax)
+
+
 def plot_credit_dynamics(
     out_dir: Path,
     feedback: Tuple[List[float], List[float], List[float], str, List[int]],
@@ -403,8 +487,7 @@ def plot_credit_dynamics(
     axes[0].set_xlabel("Time (s)")
     axes[0].set_ylabel("Credit (xBDP)")
     axes[0].set_title("Credit held at sender")
-    if start_sec is not None:
-        axes[0].set_xlim(left=start_sec)
+    apply_start_padding(axes[0], [feedback[0], no_feedback[0]], start_sec)
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -413,8 +496,7 @@ def plot_credit_dynamics(
     axes[1].set_xlabel("Time (s)")
     axes[1].set_ylabel("Credit (xBDP)")
     axes[1].set_title("Total receiver credit available")
-    if start_sec is not None:
-        axes[1].set_xlim(left=start_sec)
+    apply_start_padding(axes[1], [feedback[0], no_feedback[0]], start_sec)
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
@@ -526,6 +608,45 @@ def write_summary(
             )
 
 
+def load_credit_series(
+    trace_dir: Path,
+    tag: str,
+    bdp_pkts: float,
+    budget_pkts: int,
+    sample_sec: float,
+    ma_sec: float,
+    start_sec: Optional[float],
+) -> Optional[Tuple[List[float], List[float], List[float], str, List[int]]]:
+    sample_series = derive_credit_series_from_samples(
+        parse_credit_sample(trace_dir / f"lab2_{tag}.credit-sample.tr"),
+        sample_sec,
+        ma_sec,
+        start_sec,
+    )
+    if sample_series is not None:
+        return sample_series
+
+    protocol_series = derive_credit_series_from_protocol_traces(
+        parse_sender_credit(trace_dir / f"lab2_{tag}.sender-credit.tr"),
+        parse_receiver_credit(trace_dir / f"lab2_{tag}.receiver-credit.tr"),
+        bdp_pkts,
+        sample_sec,
+        ma_sec,
+        start_sec,
+    )
+    if protocol_series is not None:
+        return protocol_series
+
+    events = parse_credit_events(trace_dir / f"lab2_{tag}.credit-events.tr")
+    return derive_credit_series(
+        events,
+        bdp_pkts,
+        budget_pkts,
+        sample_sec,
+        ma_sec,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot lab2 sender-congestion traces.")
     parser.add_argument(
@@ -550,44 +671,27 @@ def main() -> int:
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    feedback = derive_credit_series_from_protocol_traces(
-        parse_sender_credit(args.trace_dir / f"lab2_{args.feedback_tag}.sender-credit.tr"),
-        parse_receiver_credit(args.trace_dir / f"lab2_{args.feedback_tag}.receiver-credit.tr"),
+    feedback = load_credit_series(
+        args.trace_dir,
+        args.feedback_tag,
         args.bdp_pkts,
+        args.budget_pkts,
         args.sample_sec,
         args.ma_sec,
         args.start_sec,
     )
-    no_feedback = derive_credit_series_from_protocol_traces(
-        parse_sender_credit(args.trace_dir / f"lab2_{args.no_feedback_tag}.sender-credit.tr"),
-        parse_receiver_credit(args.trace_dir / f"lab2_{args.no_feedback_tag}.receiver-credit.tr"),
+    no_feedback = load_credit_series(
+        args.trace_dir,
+        args.no_feedback_tag,
         args.bdp_pkts,
+        args.budget_pkts,
         args.sample_sec,
         args.ma_sec,
         args.start_sec,
     )
-
-    if feedback is None:
-        feedback_events = parse_credit_events(args.trace_dir / f"lab2_{args.feedback_tag}.credit-events.tr")
-        feedback = derive_credit_series(
-            feedback_events,
-            args.bdp_pkts,
-            args.budget_pkts,
-            args.sample_sec,
-            args.ma_sec,
-        )
-    if no_feedback is None:
-        no_feedback_events = parse_credit_events(args.trace_dir / f"lab2_{args.no_feedback_tag}.credit-events.tr")
-        no_feedback = derive_credit_series(
-            no_feedback_events,
-            args.bdp_pkts,
-            args.budget_pkts,
-            args.sample_sec,
-            args.ma_sec,
-        )
 
     if feedback is None or no_feedback is None:
-        raise SystemExit("Missing lab2 sender-credit/receiver-credit traces.")
+        raise SystemExit("Missing lab2 credit-sample, sender-credit/receiver-credit, or credit-events traces.")
 
     plot_credit_dynamics(out_dir, feedback, no_feedback, args.start_sec)
 

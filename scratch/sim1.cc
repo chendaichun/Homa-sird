@@ -201,6 +201,113 @@ ReadWorkloadFile (const std::string& path)
 }
 
 static std::string
+CanonicalPaperRawWorkload (const std::string& workload)
+{
+  if (workload == "google_rpc")
+    {
+      return "GOOGLE_ALL_RPC";
+    }
+  if (workload == "facebook_hadoop")
+    {
+      return "FACEBOOK_HADOOP_ALL";
+    }
+  if (workload == "web_search")
+    {
+      return "DCTCP";
+    }
+  return workload;
+}
+
+static WorkloadSpec
+ReadPaperRawWorkload (const std::string& path,
+                      const std::string& rawWorkload,
+                      const std::string& transportType,
+                      double loadFactor,
+                      uint32_t bytesPerPkt)
+{
+  std::ifstream in (path.c_str ());
+  if (!in.is_open ())
+    {
+      throw std::runtime_error ("Could not open paper raw data file: " + path);
+    }
+  if (rawWorkload.empty ())
+    {
+      throw std::runtime_error ("paperRawWorkload must be set when reading paper raw data.");
+    }
+  if (bytesPerPkt == 0)
+    {
+      throw std::runtime_error ("paperRawBytesPerPkt must be positive.");
+    }
+
+  const std::string targetWorkload = CanonicalPaperRawWorkload (rawWorkload);
+  std::map<int, double> pctByMsgSizePkts;
+  double totalPct = 0.0;
+  std::string line;
+  std::getline (in, line); // header
+  while (std::getline (in, line))
+    {
+      if (line.empty ())
+        {
+          continue;
+        }
+
+      std::istringstream row (line);
+      std::string rowTransport;
+      double rowLoadFactor = 0.0;
+      std::string rowWorkload;
+      uint64_t msgSizeBytes = 0;
+      double sizeCntPercent = 0.0;
+      double bytesPercent = 0.0;
+      uint64_t unschedBytes = 0;
+      if (!(row >> rowTransport >> rowLoadFactor >> rowWorkload >> msgSizeBytes >>
+            sizeCntPercent >> bytesPercent >> unschedBytes))
+        {
+          continue;
+        }
+
+      if (rowTransport != transportType || rowWorkload != targetWorkload ||
+          std::fabs (rowLoadFactor - loadFactor) > 1e-9)
+        {
+          continue;
+        }
+
+      uint64_t msgSizePkts = (msgSizeBytes + bytesPerPkt - 1) / bytesPerPkt;
+      msgSizePkts = std::max<uint64_t> (1, msgSizePkts);
+      msgSizePkts = std::min<uint64_t> (0xffff, msgSizePkts);
+      pctByMsgSizePkts[static_cast<int> (msgSizePkts)] += sizeCntPercent;
+      totalPct += sizeCntPercent;
+    }
+
+  if (pctByMsgSizePkts.empty ())
+    {
+      std::ostringstream error;
+      error << "No rows found in " << path
+            << " for transport=" << transportType
+            << " loadFactor=" << loadFactor
+            << " workload=" << targetWorkload;
+      throw std::runtime_error (error.str ());
+    }
+  if (totalPct <= 0.0)
+    {
+      throw std::runtime_error ("Paper raw workload has non-positive total probability.");
+    }
+
+  WorkloadSpec spec;
+  double cumulativeProbability = 0.0;
+  for (const auto& kv : pctByMsgSizePkts)
+    {
+      const int msgSizePkts = kv.first;
+      const double probability = kv.second / totalPct;
+      spec.avgMsgSizePkts += msgSizePkts * probability;
+      cumulativeProbability += probability;
+      spec.msgSizeCdf[std::min (1.0, cumulativeProbability)] = msgSizePkts;
+    }
+
+  spec.msgSizeCdf[1.0] = pctByMsgSizePkts.rbegin ()->first;
+  return spec;
+}
+
+static std::string
 ResolveWorkloadPath (const std::string& workloadName, const std::string& workloadFile)
 {
   if (!workloadFile.empty ())
@@ -224,6 +331,11 @@ main (int argc, char* argv[])
   std::string trafficConfig = "balanced";
   std::string workloadName = "";
   std::string workloadFile = "";
+  std::string paperRawFile = "inputs/homa-paper-reproduction/original-raw-data-from-paper.txt";
+  std::string paperRawWorkload = "";
+  std::string paperRawTransport = "Homa";
+  double paperRawLoadFactor = -1.0;
+  uint32_t paperRawBytesPerPkt = 1472;
 
   bool enableSird = true;
   double offeredLoad = 0.5;
@@ -275,6 +387,11 @@ main (int argc, char* argv[])
   cmd.AddValue ("trafficConfig", "balanced, core, or incast", trafficConfig);
   cmd.AddValue ("workloadName", "Logical workload name; default path resolves to inputs/<name>.txt", workloadName);
   cmd.AddValue ("workloadFile", "Explicit workload file path", workloadFile);
+  cmd.AddValue ("paperRawFile", "Paper raw data table path", paperRawFile);
+  cmd.AddValue ("paperRawWorkload", "Paper raw workload alias/name: google_rpc, facebook_hadoop, web_search, or raw WorkLoad value", paperRawWorkload);
+  cmd.AddValue ("paperRawTransport", "TransportType filter for paper raw data", paperRawTransport);
+  cmd.AddValue ("paperRawLoadFactor", "LoadFactor filter for paper raw data; negative derives from offeredLoad", paperRawLoadFactor);
+  cmd.AddValue ("paperRawBytesPerPkt", "Bytes per packet used to convert raw MsgSizeRange bytes to packet counts", paperRawBytesPerPkt);
   cmd.AddValue ("enableSird", "Enable SIRD control path", enableSird);
   cmd.AddValue ("offeredLoad", "Per-host offered load fraction for background all-to-all traffic", offeredLoad);
   cmd.AddValue ("startSec", "Background traffic start time", startSec);
@@ -369,7 +486,19 @@ main (int argc, char* argv[])
   WorkloadSpec workload;
   try
     {
-      workload = ReadWorkloadFile (ResolveWorkloadPath (workloadName, workloadFile));
+      if (!paperRawWorkload.empty ())
+        {
+          double rawLoadFactor = paperRawLoadFactor < 0.0 ? offeredLoad : paperRawLoadFactor;
+          workload = ReadPaperRawWorkload (paperRawFile,
+                                           paperRawWorkload,
+                                           paperRawTransport,
+                                           rawLoadFactor,
+                                           paperRawBytesPerPkt);
+        }
+      else
+        {
+          workload = ReadWorkloadFile (ResolveWorkloadPath (workloadName, workloadFile));
+        }
     }
   catch (const std::exception& ex)
     {

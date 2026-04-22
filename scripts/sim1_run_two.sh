@@ -6,6 +6,8 @@ cd "$ROOT_DIR"
 
 TRACE_DIR="${TRACE_DIR:-/mnt/nasDisk_ds3617/sird/HomaL4Protocol-sim1-large-leaf-spine}"
 BUILD="${BUILD:-1}"
+PLOT="${PLOT:-1}"
+PLOT_OUT_DIR="${PLOT_OUT_DIR:-$TRACE_DIR/plots}"
 TRAFFIC_CONFIGS="${TRAFFIC_CONFIGS:-balanced core incast}"
 OFFERED_LOAD="${OFFERED_LOAD:-0.5}"
 START_SEC="${START_SEC:-0.2}"
@@ -15,13 +17,18 @@ MAX_SETTLE_RETRIES="${MAX_SETTLE_RETRIES:-3}"
 SETTLE_TAIL_MULTIPLIER="${SETTLE_TAIL_MULTIPLIER:-2}"
 QUEUE_SAMPLE_US="${QUEUE_SAMPLE_US:-100}"
 GOODPUT_SAMPLE_US="${GOODPUT_SAMPLE_US:-100}"
-TRACE_MSG="${TRACE_MSG:-0}"
+TRACE_MSG="${TRACE_MSG:-1}"
 TRACE_TOR_QUEUE="${TRACE_TOR_QUEUE:-0}"
 TRACE_GOODPUT="${TRACE_GOODPUT:-1}"
 BDP_PKTS="${BDP_PKTS:-66.67}"
 DEVICE_QUEUE_MAX_SIZE="${DEVICE_QUEUE_MAX_SIZE:-17p}"
 QDISC_MAX_SIZE="${QDISC_MAX_SIZE:-1000p}"
 QDISC_MARK_THRESHOLD="${QDISC_MARK_THRESHOLD:-$(awk "BEGIN { printf \"%dp\", (1.25 * $BDP_PKTS) + 0.5 }")}"
+PAPER_RAW_FILE="${PAPER_RAW_FILE:-inputs/homa-paper-reproduction/original-raw-data-from-paper.txt}"
+PAPER_RAW_TRANSPORT="${PAPER_RAW_TRANSPORT:-Homa}"
+PAPER_RAW_LOAD_FACTOR="${PAPER_RAW_LOAD_FACTOR:--1}"
+PAPER_RAW_BYTES_PER_PKT="${PAPER_RAW_BYTES_PER_PKT:-1472}"
+PAPER_RAW_WORKLOADS="${PAPER_RAW_WORKLOADS:-google_rpc facebook_hadoop web_search}"
 SUMMARY_FILE="${SUMMARY_FILE:-$TRACE_DIR/sim1_matrix_summary.csv}"
 ENFORCE_MSG_COMPLETE="${ENFORCE_MSG_COMPLETE:-0}"
 
@@ -36,7 +43,6 @@ fi
 run_case() {
   local traffic_config="$1"
   local workload_tag="$2"
-  local workload_file="$3"
   local tag="${traffic_config}_${workload_tag}_load50"
   local log_file="$TRACE_DIR/sim1_${tag}.run.log"
   local settle_tail_sec="$SETTLE_TAIL_SEC"
@@ -48,12 +54,16 @@ run_case() {
       "$TRACE_DIR/sim1_${tag}.tor-egress-queue.tr" \
       "$TRACE_DIR/sim1_${tag}.goodput.tr"
 
-    echo "[$tag] attempt=$attempt settleTailSec=$settle_tail_sec start $(date '+%F %T') workload=$workload_file trafficConfig=$traffic_config offeredLoad=$OFFERED_LOAD" | tee "$log_file"
+    echo "[$tag] attempt=$attempt settleTailSec=$settle_tail_sec start $(date '+%F %T') workload=$workload_tag trafficConfig=$traffic_config offeredLoad=$OFFERED_LOAD paperRawFile=$PAPER_RAW_FILE" | tee "$log_file"
     "$BIN_PATH" \
       "--simTag=$tag" \
       "--outputDir=$TRACE_DIR" \
       "--trafficConfig=$traffic_config" \
-      "--workloadFile=$workload_file" \
+      "--paperRawFile=$PAPER_RAW_FILE" \
+      "--paperRawWorkload=$workload_tag" \
+      "--paperRawTransport=$PAPER_RAW_TRANSPORT" \
+      "--paperRawLoadFactor=$PAPER_RAW_LOAD_FACTOR" \
+      "--paperRawBytesPerPkt=$PAPER_RAW_BYTES_PER_PKT" \
       "--offeredLoad=$OFFERED_LOAD" \
       "--startSec=$START_SEC" \
       "--durationSec=$DURATION_SEC" \
@@ -99,17 +109,11 @@ run_case() {
 
 pids=()
 read -r -a traffic_configs <<< "$TRAFFIC_CONFIGS"
-workload_tags=(dctcp)
-workload_files=(inputs/homa-paper-reproduction/DCTCP-MsgSizeDist.txt)
-
-if [[ -f inputs/Facebook_HadoopDist_All.txt ]]; then
-  workload_tags+=(facebook_hadoop)
-  workload_files+=(inputs/Facebook_HadoopDist_All.txt)
-fi
+read -r -a workload_tags <<< "$PAPER_RAW_WORKLOADS"
 
 for traffic_config in "${traffic_configs[@]}"; do
-  for idx in "${!workload_tags[@]}"; do
-    run_case "$traffic_config" "${workload_tags[$idx]}" "${workload_files[$idx]}" &
+  for workload_tag in "${workload_tags[@]}"; do
+    run_case "$traffic_config" "$workload_tag" &
     pids+=("$!")
   done
 done
@@ -136,5 +140,14 @@ done
     done
   done
 } > "$SUMMARY_FILE"
+
+if [[ "$PLOT" == "1" ]]; then
+  python3 scripts/sim1_plot.py \
+    --trace-dir "$TRACE_DIR" \
+    --out-dir "$PLOT_OUT_DIR" \
+    --start-sec "$START_SEC" \
+    --end-sec "$(awk -v s="$START_SEC" -v d="$DURATION_SEC" 'BEGIN {printf "%.9f", s+d}')" \
+    --bdp-pkts "$BDP_PKTS"
+fi
 
 exit "$status"
